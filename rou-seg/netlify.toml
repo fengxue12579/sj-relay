@@ -8,3 +8,11 @@
 [[edge_functions]]
   path = "/health"
   function = "rou-seg"
+
+[[edge_functions]]
+  path = "/m/*"
+  function = "mdgw-seg"
+
+[[edge_functions]]
+  path = "/mhealth"
+  function = "mdgw-seg"
