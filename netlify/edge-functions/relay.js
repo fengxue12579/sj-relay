@@ -53,6 +53,30 @@ async function mintSession(slug) {
   return { cookie, ua, cfg };
 }
 
+function segUrlsOf(text, baseUrl) {
+  return text.split("\n").filter((l) => l.trim() && !l.startsWith("#")).map((l) => new URL(l.trim(), baseUrl).toString());
+}
+function parseVariants(text, baseUrl) {
+  const lines = text.split("\n");
+  const vars = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.includes("EXT-X-STREAM-INF")) continue;
+    const bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+    const res = l.match(/RESOLUTION=(\d+)x(\d+)/) || [];
+    let h = res[2] ? parseInt(res[2], 10) : 0;
+    if (!h) { const nm = l.match(/NAME="?(\d+)p/i); if (nm) h = parseInt(nm[1], 10); }
+    for (let j = i + 1; j < lines.length; j++) {
+      const u = lines[j].trim();
+      if (!u) continue;
+      if (u.startsWith("#")) break;
+      vars.push({ h, bw, url: new URL(u, baseUrl).toString() });
+      break;
+    }
+  }
+  vars.sort((a, b) => (b.bw - a.bw) || (b.h - a.h));
+  return vars;
+}
 async function getSession(slug) {
   const hit = sessions.get(slug);
   if (hit && Date.now() - hit.at < SESSION_TTL) return hit;
@@ -63,13 +87,33 @@ async function getSession(slug) {
   }, 20000);
   if (pr.status !== 200) throw new Error("playlist " + pr.status);
   const text = await pr.text();
-  const lines = text.split("\n");
   const isMaster = text.includes("EXT-X-STREAM-INF");
-  let segs = [];
-  if (!isMaster) segs = lines.filter((l) => l.trim() && !l.startsWith("#")).map((l) => new URL(l, listUrl).toString());
-  const sess = { cookie, ua, cfg, listUrl, text, isMaster, segs, at: Date.now() };
+  const sess = { cookie, ua, cfg, listUrl, text, isMaster, variants: [], media: null, vcache: new Map(), at: Date.now() };
+  if (isMaster) sess.variants = parseVariants(text, listUrl);
+  else sess.media = { text, listUrl, segs: segUrlsOf(text, listUrl), q: 0 };
   sessions.set(slug, sess);
   return sess;
+}
+function pickVariant(sess, q) {
+  if (!sess.variants.length) return null;
+  if (q) { const v = sess.variants.find((v) => v.h === q); if (v) return v; }
+  return sess.variants[0];
+}
+// 取锁定档位的媒体清单: 多档片按 q 选档 (缺省最高档), 单档片直接返回; 结果按档缓存进会话
+async function getMedia(sess, q) {
+  if (!sess.isMaster) return sess.media;
+  const v = pickVariant(sess, q);
+  if (!v) return { text: sess.text, listUrl: sess.listUrl, segs: [], q: 0, masterFallback: true };
+  const key = v.h || v.url;
+  if (sess.vcache.has(key)) return sess.vcache.get(key);
+  const pr = await fetchT(v.url, {
+    headers: { "User-Agent": sess.ua, Referer: PLAY + "/", ...(sess.cookie ? { Cookie: sess.cookie } : {}) },
+  }, 20000);
+  if (pr.status !== 200) throw new Error("variant " + pr.status);
+  const text = await pr.text();
+  const media = { text, listUrl: v.url, segs: segUrlsOf(text, v.url), q: v.h };
+  sess.vcache.set(key, media);
+  return media;
 }
 
 // ---------- 分片缓存与预取 ----------
@@ -97,16 +141,15 @@ function cachePut(key, buf) {
     segCache.delete(k0);
   }
 }
-async function fetchSegment(slug, n) {
-  const key = slug + "#" + n;
+function segKey(slug, q, n) { return slug + "@" + (q || 0) + "#" + n; }
+async function fetchSegUrl(slug, q, n, segUrl) {
+  const key = segKey(slug, q, n);
   const hit = segCache.get(key);
   if (hit) return hit.buf;
   if (inflight.has(key)) return inflight.get(key);
   const p = (async () => {
     const sess = await getSession(slug);
-    const url = sess.segs[n];
-    if (!url) throw new Error("segment out of range");
-    const r = await fetchT(url, {
+    const r = await fetchT(segUrl, {
       headers: { "User-Agent": sess.ua, Referer: PLAY + "/", ...(sess.cookie ? { Cookie: sess.cookie } : {}) },
     }, 45000);
     if (r.status !== 200 && r.status !== 206) throw new Error("segment " + r.status);
@@ -117,37 +160,32 @@ async function fetchSegment(slug, n) {
   inflight.set(key, p);
   try { return await p; } finally { inflight.delete(key); }
 }
-async function fetchSegmentBg(slug, n) {
+async function fetchSegBg(slug, q, n, segUrl) {
   await parAcquire();
-  try { await fetchSegment(slug, n); } catch (e) { /* 预取失败忽略 */ } finally { parRelease(); }
+  try { await fetchSegUrl(slug, q, n, segUrl); } catch (e) { /* 预取失败忽略 */ } finally { parRelease(); }
 }
-function prefetch(slug, fromN) {
-  getSession(slug).then((sess) => {
-    for (let n = fromN; n < Math.min(sess.segs.length, fromN + PREFETCH_AHEAD); n++) {
-      const key = slug + "#" + n;
-      if (!segCache.has(key) && !inflight.has(key)) fetchSegmentBg(slug, n);
-    }
-  }).catch(() => {});
+function prefetchMedia(slug, media, fromN) {
+  if (!media || !media.segs) return;
+  for (let n = fromN; n < Math.min(media.segs.length, fromN + PREFETCH_AHEAD); n++) {
+    const key = segKey(slug, media.q, n);
+    if (!segCache.has(key) && !inflight.has(key)) fetchSegBg(slug, media.q, n, media.segs[n]);
+  }
 }
 
 // ---------- 响应辅助 ----------
 function textResp(body, status, type) {
   return new Response(body, { status: status || 200, headers: { "Content-Type": type || "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
 }
-function rewritePlaylist(sess, slug, origin) {
+function rewriteMedia(media, slug, origin) {
   const out = [];
   let segIdx = 0;
-  for (const line of sess.text.split("\n")) {
+  for (const line of media.text.split("\n")) {
     const t = line.trim();
     if (!t) { out.push(line); continue; }
     if (t.startsWith("#")) { out.push(line); continue; }
-    const abs = new URL(t, sess.listUrl).toString();
-    if (sess.isMaster) {
-      out.push(origin + "/v/" + b64e({ u: abs, s: slug }) + ".m3u8");
-    } else {
-      out.push(origin + "/s/" + b64e({ u: abs, s: slug, n: segIdx }) + ".ts");
-      segIdx++;
-    }
+    const abs = new URL(t, media.listUrl).toString();
+    out.push(origin + "/s/" + b64e({ u: abs, s: slug, n: segIdx, q: media.q }) + ".ts");
+    segIdx++;
   }
   return out.join("\n");
 }
@@ -158,7 +196,7 @@ async function handle(req) {
   const origin = url.origin;
   const path = url.pathname;
   try {
-    if (path === "/" || path === "/health") return textResp(JSON.stringify({ ok: true, name: "sj-relay v2" }), 200, "application/json");
+    if (path === "/" || path === "/health") return textResp(JSON.stringify({ ok: true, name: "sj-relay v3" }), 200, "application/json");
     if (path === "/stats") {
       return textResp(JSON.stringify({ sessions: sessions.size, cachedSegments: segCache.size, cacheMB: +(cacheBytes / 1048576).toFixed(1) }), 200, "application/json");
     }
@@ -173,30 +211,39 @@ async function handle(req) {
     let m = path.match(/^\/play\/([A-Za-z0-9._-]+)\.m3u8$/);
     if (m) {
       const slug = m[1];
+      const q = parseInt(url.searchParams.get("q") || "0", 10) || 0;
       const sess = await getSession(slug);
-      const body = rewritePlaylist(sess, slug, origin);
-      if (!sess.isMaster) prefetch(slug, 0);
+      const media = await getMedia(sess, q);
+      if (media.masterFallback) return textResp("master without variants", 502);
+      const body = rewriteMedia(media, slug, origin);
+      prefetchMedia(slug, media, 0);
       return textResp(body, 200, "application/vnd.apple.mpegurl");
     }
     m = path.match(/^\/v\/([A-Za-z0-9_-]+)\.m3u8$/);
     if (m) {
+      // 旧版 master 直通留下的变体地址: 不再改会话, 按地址里的档位锁定返回
       const tok = JSON.parse(b64d(m[1]));
       const sess = await getSession(tok.s);
       const pr = await fetchT(tok.u, { headers: { "User-Agent": sess.ua, Referer: PLAY + "/", ...(sess.cookie ? { Cookie: sess.cookie } : {}) } }, 20000);
       if (pr.status !== 200) return textResp("variant " + pr.status, 502);
       const text = await pr.text();
-      sess.text = text; sess.listUrl = tok.u; sess.isMaster = false;
-      sess.segs = text.split("\n").filter((l) => l.trim() && !l.startsWith("#")).map((l) => new URL(l, tok.u).toString());
-      sess.at = Date.now();
-      const body = rewritePlaylist(sess, tok.s, origin);
-      prefetch(tok.s, 0);
+      const qm = tok.u.match(/[vV](\d+)p\.m3u8/);
+      const media = { text, listUrl: tok.u, segs: segUrlsOf(text, tok.u), q: qm ? parseInt(qm[1], 10) : 0 };
+      const body = rewriteMedia(media, tok.s, origin);
+      prefetchMedia(tok.s, media, 0);
       return textResp(body, 200, "application/vnd.apple.mpegurl");
     }
     m = path.match(/^\/s\/([A-Za-z0-9_-]+)\.ts$/);
     if (m) {
       const tok = JSON.parse(b64d(m[1]));
-      const buf = await fetchSegment(tok.s, tok.n | 0);
-      prefetch(tok.s, (tok.n | 0) + 1);
+      const buf = await fetchSegUrl(tok.s, tok.q || 0, tok.n | 0, tok.u);
+      (async () => {
+        try {
+          const sess = await getSession(tok.s);
+          const media = await getMedia(sess, tok.q || 0);
+          prefetchMedia(tok.s, media, (tok.n | 0) + 1);
+        } catch (e) { /* 预取失败忽略 */ }
+      })();
       const range = req.headers.get("range");
       const total = buf.byteLength;
       const headers = { "Content-Type": "video/mp2t", "Accept-Ranges": "bytes", "Cache-Control": "no-store" };
