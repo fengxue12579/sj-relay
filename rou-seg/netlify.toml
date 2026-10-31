@@ -1,0 +1,10 @@
+[build]
+  publish = "."
+
+[[edge_functions]]
+  path = "/s/*"
+  function = "rou-seg"
+
+[[edge_functions]]
+  path = "/health"
+  function = "rou-seg"
